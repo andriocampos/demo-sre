@@ -81,6 +81,10 @@ Repositório de portfólio que demonstra práticas reais de **CI/CD**, **GitOps*
 
 ### Deploy completo (one-click)
 
+> **Pré-requisito:** o secret `AWS_ROLE_ARN` deve estar configurado no repositório.
+> Ele aponta para a IAM Role criada no repo `aws-github-auth`. Consulte
+> **[docs/oidc.md](docs/oidc.md)** para provisionar e registrar o secret.
+
 1. Acesse **Actions** → **🚀 SRE Demo - Deploy/Destroy**
 2. Clique **Run workflow** → selecione `apply`
 3. Aguarde ~5 minutos
@@ -160,6 +164,18 @@ Se você tentar um novo `apply` com a infra ainda ativa, o workflow **bloqueia**
 - **Chave SSH efêmera** — Gerada pelo Terraform a cada deploy, nunca persiste
 - **State isolado** — Bucket S3 criado e destruído junto com a infra
 
+### 🔑 Autenticação isolada — repositório `aws-github-auth`
+
+Por questões de segurança, o Terraform que provisiona o **OIDC Provider** e a
+**IAM Role** de deploy **não vive neste repositório**. Ele foi separado no
+repositório dedicado **`aws-github-auth`**, reduzindo o blast radius: a base de
+autenticação (recurso sensível e de longa duração) fica isolada do lab efêmero.
+
+Este repositório apenas **consome** a role via o secret `AWS_ROLE_ARN`.
+
+> 📖 Quer replicar o cenário do zero? Veja **[docs/oidc.md](docs/oidc.md)** — guia
+> completo para reconstruir o OIDC Provider + IAM Role e registrar o secret.
+
 ---
 
 ## 🛠️ Tecnologias
@@ -199,6 +215,12 @@ Se você tentar um novo `apply` com a infra ainda ativa, o workflow **bloqueia**
 | Validação com rollback | Se algum serviço não responde, o Ansible desfaz o deploy |
 | `terraform_wrapper: false` | Permite capturar outputs diretamente no workflow |
 | `tls_private_key` no Terraform | Chave efêmera — não precisa de secrets management para lab |
+
+---
+
+## 📚 Documentação adicional
+
+- [Autenticação OIDC (GitHub → AWS) e repo `aws-github-auth`](docs/oidc.md)
 
 ---
 
