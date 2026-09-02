@@ -170,18 +170,136 @@ resource "aws_iam_role" "deploy" {
 # ---------------------------------------------------------------------------
 # 3. Permissões da role — o QUE o Terraform do lab precisa fazer
 # ---------------------------------------------------------------------------
-# Least privilege: apenas os serviços que o lab realmente provisiona.
-# (VPC/EC2 para a infra, S3 para o backend de state efêmero.)
+# LEAST PRIVILEGE: apenas as ações que o `terraform plan/apply/destroy` do
+# módulo infra-demo realmente exerce.
+#
+# Recursos provisionados e ações correspondentes:
+#   - aws_vpc / aws_subnet / aws_internet_gateway / aws_route_table(+assoc)
+#   - aws_security_group (+ regras ingress/egress)
+#   - aws_key_pair  (aws_instance usa a chave; tls_private_key é local, sem IAM)
+#   - data.aws_ami  (DescribeImages)
+#   - aws_instance  (+ volume EBS gp3, tags)
+#
+# Nota: as APIs de rede/criação do EC2 (RunInstances, Create*) NÃO suportam
+# restrição confiável por ARN de recurso no momento da criação, por isso o
+# bloco EC2 usa Resource "*". O escopo real é dado pela lista fechada de ações
+# (nenhum "ec2:*") e pelo trust restrito ao repositório.
 data "aws_iam_policy_document" "deploy_permissions" {
+
+  # --- Leitura (describe) — necessária para plan/refresh/import ---
   statement {
-    sid    = "EC2AndVPC"
+    sid    = "EC2Describe"
     effect = "Allow"
     actions = [
-      "ec2:*"
+      "ec2:DescribeVpcs",
+      "ec2:DescribeVpcAttribute",
+      "ec2:DescribeSubnets",
+      "ec2:DescribeInternetGateways",
+      "ec2:DescribeRouteTables",
+      "ec2:DescribeSecurityGroups",
+      "ec2:DescribeSecurityGroupRules",
+      "ec2:DescribeKeyPairs",
+      "ec2:DescribeImages",
+      "ec2:DescribeInstances",
+      "ec2:DescribeInstanceAttribute",
+      "ec2:DescribeInstanceTypes",
+      "ec2:DescribeInstanceCreditSpecifications",
+      "ec2:DescribeVolumes",
+      "ec2:DescribeAvailabilityZones",
+      "ec2:DescribeNetworkInterfaces",
+      "ec2:DescribeTags"
     ]
     resources = ["*"]
   }
 
+  # --- VPC / Networking (create + delete + modify) ---
+  statement {
+    sid    = "EC2Networking"
+    effect = "Allow"
+    actions = [
+      "ec2:CreateVpc",
+      "ec2:DeleteVpc",
+      "ec2:ModifyVpcAttribute",
+      "ec2:CreateSubnet",
+      "ec2:DeleteSubnet",
+      "ec2:ModifySubnetAttribute",
+      "ec2:CreateInternetGateway",
+      "ec2:DeleteInternetGateway",
+      "ec2:AttachInternetGateway",
+      "ec2:DetachInternetGateway",
+      "ec2:CreateRouteTable",
+      "ec2:DeleteRouteTable",
+      "ec2:CreateRoute",
+      "ec2:DeleteRoute",
+      "ec2:AssociateRouteTable",
+      "ec2:DisassociateRouteTable"
+    ]
+    resources = ["*"]
+  }
+
+  # --- Security Group + regras ---
+  statement {
+    sid    = "EC2SecurityGroup"
+    effect = "Allow"
+    actions = [
+      "ec2:CreateSecurityGroup",
+      "ec2:DeleteSecurityGroup",
+      "ec2:AuthorizeSecurityGroupIngress",
+      "ec2:AuthorizeSecurityGroupEgress",
+      "ec2:RevokeSecurityGroupIngress",
+      "ec2:RevokeSecurityGroupEgress"
+    ]
+    resources = ["*"]
+  }
+
+  # --- Key Pair (import da chave pública gerada pelo provider TLS) ---
+  statement {
+    sid    = "EC2KeyPair"
+    effect = "Allow"
+    actions = [
+      "ec2:ImportKeyPair",
+      "ec2:DeleteKeyPair"
+    ]
+    resources = ["*"]
+  }
+
+  # --- Instância EC2 + volume EBS ---
+  statement {
+    sid    = "EC2Instance"
+    effect = "Allow"
+    actions = [
+      "ec2:RunInstances",
+      "ec2:TerminateInstances"
+    ]
+    resources = ["*"]
+  }
+
+  # --- Tags (Terraform adiciona tags em todos os recursos criados) ---
+  statement {
+    sid    = "EC2Tagging"
+    effect = "Allow"
+    actions = [
+      "ec2:CreateTags",
+      "ec2:DeleteTags"
+    ]
+    resources = ["*"]
+    # Restringe a criação de tags ao momento de criação dos recursos
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:CreateAction"
+      values = [
+        "CreateVpc",
+        "CreateSubnet",
+        "CreateInternetGateway",
+        "CreateRouteTable",
+        "CreateSecurityGroup",
+        "ImportKeyPair",
+        "RunInstances"
+      ]
+    }
+  }
+
+  # --- Backend de state: restrito ao bucket do lab ---
   statement {
     sid    = "StateBucket"
     effect = "Allow"
@@ -196,7 +314,6 @@ data "aws_iam_policy_document" "deploy_permissions" {
       "s3:PutBucketVersioning",
       "s3:ListBucketVersions"
     ]
-    # Restrito ao bucket de state do lab
     resources = [
       "arn:aws:s3:::tfstate-sre-demo-lab",
       "arn:aws:s3:::tfstate-sre-demo-lab/*"
@@ -211,9 +328,12 @@ resource "aws_iam_role_policy" "deploy" {
 }
 ```
 
-> **Nota sobre `ec2:*`:** para uma demo é aceitável, mas em produção reduza para
-> as ações específicas exigidas pelo `terraform plan` (use `terraform plan` +
-> logs do CloudTrail para levantar a lista exata e aplicar least privilege real).
+> **Sobre o `Resource: "*"` no bloco EC2:** as APIs de criação de rede/instância
+> do EC2 não permitem restrição confiável por ARN no ato da criação. O
+> least privilege aqui é obtido pela **lista fechada de ações** (sem `ec2:*`) e
+> pelo **trust restrito ao repositório**. Para endurecer ainda mais, é possível
+> adicionar `condition` por `aws:RequestedRegion` (travar em `us-east-1`) ou por
+> tag (`aws:RequestTag/Environment = sre-demo`) nas ações de criação.
 
 ### `outputs.tf`
 
@@ -302,7 +422,7 @@ O output deve mostrar o ARN da role assumida (`assumed-role/gha-sre-demo-deploy/
 | **Sem credenciais estáticas** | OIDC emite tokens de curta duração; nada de access keys no GitHub |
 | **Trust restrito ao repo** | Condition `sub = repo:org/repo:*` impede outros repos de assumir a role |
 | **Audience validada** | Condition `aud = sts.amazonaws.com` |
-| **Permissões escopadas** | S3 restrito ao bucket de state; recomenda-se reduzir `ec2:*` em produção |
+| **Permissões escopadas** | Ações EC2 enumeradas (sem `ec2:*`); S3 restrito ao bucket de state |
 | **Separação de repositórios** | Autenticação (`aws-github-auth`) isolada do lab (`demo-sre`) |
 | **Travar por branch (opcional)** | Ajuste o `sub` para `ref:refs/heads/main` para permitir só a `main` |
 
