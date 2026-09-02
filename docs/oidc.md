@@ -128,8 +128,9 @@ resource "aws_iam_openid_connect_provider" "github" {
 # ---------------------------------------------------------------------------
 # 2. Trust Policy — QUEM pode assumir a role
 # ---------------------------------------------------------------------------
-# Restringe a role ao repositório específico (least privilege no trust).
-# 'sub' garante que apenas workflows daquele repo/branch obtenham credenciais.
+# ABORDAGEM RECOMENDADA (2026+): usar o condition key `repository` em vez de
+# casar o `sub`. O claim `repository` é sempre "owner/repo" (sem IDs), imune à
+# mudança do "immutable subject claim" do GitHub (ver seção no fim do doc).
 data "aws_iam_policy_document" "trust" {
   statement {
     effect  = "Allow"
@@ -147,13 +148,19 @@ data "aws_iam_policy_document" "trust" {
       values   = ["sts.amazonaws.com"]
     }
 
-    # Restringe ao repositório (qualquer branch). Para travar em uma branch:
-    #   "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main"
+    # Restringe ao repositório — claim estável, sem IDs, sem wildcard
     condition {
-      test     = "StringLike"
-      variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_org}/${var.github_repo}:*"]
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:repository"
+      values   = ["${var.github_org}/${var.github_repo}"]
     }
+
+    # (Opcional) Travar em uma branch específica:
+    # condition {
+    #   test     = "StringEquals"
+    #   variable = "token.actions.githubusercontent.com:ref"
+    #   values   = ["refs/heads/main"]
+    # }
   }
 }
 
@@ -420,11 +427,85 @@ O output deve mostrar o ARN da role assumida (`assumed-role/gha-sre-demo-deploy/
 | Prática | Como |
 |---------|------|
 | **Sem credenciais estáticas** | OIDC emite tokens de curta duração; nada de access keys no GitHub |
-| **Trust restrito ao repo** | Condition `sub = repo:org/repo:*` impede outros repos de assumir a role |
+| **Trust restrito ao repo** | Condition `repository = org/repo` (claim estável, sem wildcard) |
 | **Audience validada** | Condition `aud = sts.amazonaws.com` |
 | **Permissões escopadas** | Ações EC2 enumeradas (sem `ec2:*`); S3 restrito ao bucket de state |
 | **Separação de repositórios** | Autenticação (`aws-github-auth`) isolada do lab (`demo-sre`) |
-| **Travar por branch (opcional)** | Ajuste o `sub` para `ref:refs/heads/main` para permitir só a `main` |
+| **Travar por branch (opcional)** | Condition `ref = refs/heads/main` para permitir só a `main` |
+
+---
+
+## ⚠️ Immutable Subject Claims — o gotcha do `sub` (leia isto)
+
+### O que mudou
+
+Desde **15 de julho de 2026**, o GitHub passou a emitir, **por padrão**, um `sub`
+(subject claim) **imutável** para repositórios novos, que inclui os **IDs
+numéricos** de owner e repositório:
+
+```
+# Formato ANTIGO (repos criados até 15/jul/2026):
+repo:andriocampos/demo-sre:ref:refs/heads/main
+
+# Formato NOVO / imutável (repos criados após 15/jul/2026):
+repo:andriocampos@5881234/demo-sre@1354260599:ref:refs/heads/main
+                       ^^^^^^^          ^^^^^^^^^^
+                       owner_id         repo_id
+```
+
+**Por quê:** os IDs sobrevivem a rename/transfer do repositório. Isso impede que
+um repositório recriado com o mesmo nome herde o acesso de um repo antigo
+deletado (ataque de *repo name reuse*). Renomear o repo **não** volta ao formato
+antigo — os IDs são imutáveis por design.
+
+**Sintoma se você errar:** o `AssumeRoleWithWebIdentity` falha com
+`Not authorized to perform sts:AssumeRoleWithWebIdentity`, mesmo com secret e
+role corretos. No CloudTrail, o evento aparece com `errorCode: AccessDenied` e
+o `userIdentity.userName` mostra o `sub` real com os IDs.
+
+### Por que a abordagem por `repository` (seção 2) resolve isso
+
+O claim `repository` **sempre** vem como `owner/repo` puro, sem IDs, em qualquer
+formato de `sub`. Por isso a trust policy da seção 2 (`StringEquals` em
+`repository`) é **imune** a essa mudança e é a **recomendação atual da AWS**.
+
+### Alternativa: fixar o `sub` com os IDs exatos (sem wildcard)
+
+Se preferir travar pelo `sub` (mais explícito e auditável), use os **IDs exatos**
+em vez de wildcard. Primeiro descubra os IDs:
+
+```bash
+# owner_id e repo_id de uma vez:
+gh api repos/andriocampos/demo-sre --jq '{owner_id: .owner.id, repo_id: .id}'
+# => {"owner_id":5881234,"repo_id":1354260599}
+
+# Ou o prefixo do sub já montado exatamente como o GitHub emite:
+gh api repos/andriocampos/demo-sre/actions/oidc/customization/sub --jq '.sub_claim_prefix'
+# => repo:andriocampos@5881234/demo-sre@1354260599
+```
+
+Com os IDs, a condition fica **fixa** (recomendado — evita wildcard):
+
+```hcl
+condition {
+  test     = "StringEquals"
+  variable = "token.actions.githubusercontent.com:sub"
+  values   = ["repo:andriocampos@5881234/demo-sre@1354260599:ref:refs/heads/main"]
+}
+```
+
+> **`StringEquals` (fixo) vs `StringLike` (wildcard):** prefira `StringEquals`
+> com o `sub` completo (incluindo `:ref:refs/heads/main`) — é o mais restritivo
+> e auditável. Use `StringLike` com `...@1354260599:*` apenas se precisar aceitar
+> múltiplos refs (branches/tags/PRs) do mesmo repo.
+
+### Como verificar o formato que o SEU repo emite
+
+```bash
+gh api repos/OWNER/REPO/actions/oidc/customization/sub --jq '.sub_claim_prefix'
+```
+- Retorno `repo:OWNER/REPO`               → formato antigo (sem IDs)
+- Retorno `repo:OWNER@<id>/REPO@<id>`      → formato imutável (com IDs)
 
 ---
 
@@ -432,3 +513,5 @@ O output deve mostrar o ARN da role assumida (`assumed-role/gha-sre-demo-deploy/
 
 - [Configuring OpenID Connect in AWS — GitHub Docs](https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services)
 - [aws-actions/configure-aws-credentials](https://github.com/aws-actions/configure-aws-credentials)
+- [Immutable subject claims for GitHub Actions OIDC tokens — GitHub Changelog (2026-04-23)](https://github.blog/changelog/2026-04-23-immutable-subject-claims-for-github-actions-oidc-tokens/)
+- [About security hardening with OpenID Connect — claims disponíveis (`repository`, `ref`, `sub`, ...)](https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/about-security-hardening-with-openid-connect)
