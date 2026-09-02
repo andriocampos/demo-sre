@@ -1,0 +1,496 @@
+# =============================================================================
+# PIPELINE ONE-CLICK — SRE Demo
+# Cria VPC + EC2, executa Ansible (Docker + App + Monitoramento), valida e
+# exibe custo/hora. Auto-destroy após 15 minutos.
+#
+# SEGURANÇA DE CUSTO:
+#   - Auto-destroy após 15 minutos (impede esquecimento)
+#   - Bloqueio de execuções simultâneas (impede infra duplicada)
+#
+# STATE: Backend S3 efêmero — criado no apply, destruído no destroy.
+# =============================================================================
+
+name: '🚀 SRE Demo - Deploy/Destroy'
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Ação a executar'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - apply
+          - destroy
+
+permissions:
+  id-token: write
+  contents: read
+  actions: write
+
+# -----------------------------------------------------------------------
+# BLOQUEIO DE CONCORRÊNCIA: Apenas uma execução por vez.
+# Se tentar rodar com outra ativa, fica em fila (cancel-in-progress: false)
+# ou cancela a nova (cancel-in-progress: true).
+# -----------------------------------------------------------------------
+concurrency:
+  group: sre-demo-lab
+  cancel-in-progress: false
+
+env:
+  TF_WORKING_DIR: infra-demo
+  AWS_REGION: us-east-1
+  STATE_BUCKET: tfstate-sre-demo-lab
+  LAB_TTL_MINUTES: 15
+
+jobs:
+  # ===========================================================================
+  # JOB 1: INFRAESTRUTURA (Terraform)
+  # ===========================================================================
+  infra:
+    name: '🏗️ Terraform ${{ github.event.inputs.action }}'
+    runs-on: ubuntu-latest
+
+    outputs:
+      instance_ip: ${{ steps.tf_output.outputs.instance_ip }}
+      instance_type: ${{ steps.tf_output.outputs.instance_type }}
+      instance_id: ${{ steps.tf_output.outputs.instance_id }}
+
+    steps:
+      - name: Checkout do Código
+        uses: actions/checkout@v4
+
+      - name: Autenticação AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # -----------------------------------------------------------------------
+      # LOCK: Se o bucket de state existe, o lab já está ativo → bloqueia
+      # -----------------------------------------------------------------------
+      - name: '🔒 Verificar se lab já está ativo'
+        if: github.event.inputs.action == 'apply'
+        run: |
+          if aws s3api head-bucket --bucket "${{ env.STATE_BUCKET }}" 2>/dev/null; then
+            # Bucket existe = lab ativo. Calcular tempo restante.
+            CREATED=$(aws s3api list-objects-v2 \
+              --bucket "${{ env.STATE_BUCKET }}" \
+              --query 'Contents[0].LastModified' \
+              --output text 2>/dev/null || echo "")
+
+            if [ -n "$CREATED" ] && [ "$CREATED" != "None" ]; then
+              CREATED_EPOCH=$(date -d "$CREATED" +%s)
+              NOW_EPOCH=$(date +%s)
+              ELAPSED_MIN=$(( (NOW_EPOCH - CREATED_EPOCH) / 60 ))
+              REMAINING_MIN=$(( ${{ env.LAB_TTL_MINUTES }} - ELAPSED_MIN ))
+              [ $REMAINING_MIN -lt 0 ] && REMAINING_MIN=0
+            else
+              ELAPSED_MIN="?"
+              REMAINING_MIN="?"
+            fi
+
+            echo ""
+            echo "╔══════════════════════════════════════════════════════════════╗"
+            echo "║           🚫  EXECUÇÃO BLOQUEADA                            ║"
+            echo "╠══════════════════════════════════════════════════════════════╣"
+            echo "║                                                              ║"
+            echo "║  O Lab já está em execução há ~${ELAPSED_MIN} min.           ║"
+            echo "║  Faltam ~${REMAINING_MIN} min para o destroy automático.     ║"
+            echo "║                                                              ║"
+            echo "║  Opções:                                                     ║"
+            echo "║    1. Aguarde o destroy automático                           ║"
+            echo "║    2. Execute manualmente com action = destroy               ║"
+            echo "║                                                              ║"
+            echo "╚══════════════════════════════════════════════════════════════╝"
+            echo ""
+
+            cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🚫 Execução Bloqueada
+
+          **O Lab já está ativo há ~${ELAPSED_MIN} minutos.**
+          Faltam **~${REMAINING_MIN} minutos** para o destroy automático.
+
+          ### O que fazer?
+          1. ⏳ Aguarde o destroy automático
+          2. 🗑️ Execute: **Actions → Run workflow → \`destroy\`**
+          EOF
+
+            exit 1
+          fi
+
+          echo "✓ Nenhum lab ativo. Prosseguindo com deploy..."
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.7"
+          terraform_wrapper: false
+
+      # -----------------------------------------------------------------------
+      # Garantir que o bucket de state exista (idempotente)
+      # -----------------------------------------------------------------------
+      - name: Criar bucket de state S3 (se não existir)
+        run: |
+          if aws s3api head-bucket --bucket "${{ env.STATE_BUCKET }}" 2>/dev/null; then
+            echo "✓ Bucket ${{ env.STATE_BUCKET }} já existe"
+          else
+            echo "Criando bucket ${{ env.STATE_BUCKET }}..."
+            aws s3api create-bucket \
+              --bucket "${{ env.STATE_BUCKET }}" \
+              --region "${{ env.AWS_REGION }}"
+            echo "✓ Bucket criado"
+          fi
+
+      - name: Terraform Init (com backend S3)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=sre-demo/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          if [ "${{ github.event.inputs.action }}" == "destroy" ]; then
+            terraform plan -destroy -out=tfplan
+          else
+            terraform plan -out=tfplan
+          fi
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: Capturar Outputs do Terraform
+        id: tf_output
+        if: github.event.inputs.action == 'apply'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          echo "instance_ip=$(terraform output -raw instance_public_ip)" >> $GITHUB_OUTPUT
+          echo "instance_type=$(terraform output -raw instance_type)" >> $GITHUB_OUTPUT
+          echo "instance_id=$(terraform output -raw instance_id)" >> $GITHUB_OUTPUT
+
+          # Salvar chave privada para Ansible
+          terraform output -raw private_key_pem > /tmp/ssh_key.pem
+          chmod 600 /tmp/ssh_key.pem
+
+      - name: Upload SSH Key
+        if: github.event.inputs.action == 'apply'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssh-key
+          path: /tmp/ssh_key.pem
+          retention-days: 1
+
+      # -----------------------------------------------------------------------
+      # Após destroy: remover o bucket de state (limpeza total)
+      # -----------------------------------------------------------------------
+      - name: Destruir bucket de state S3
+        if: github.event.inputs.action == 'destroy'
+        run: |
+          echo "🗑️ Removendo bucket de state..."
+          # Deletar todas as versões de objetos
+          aws s3api list-object-versions \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+            --output json | \
+          aws s3api delete-objects \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --delete file:///dev/stdin 2>/dev/null || true
+          # Deletar delete markers
+          aws s3api list-object-versions \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+            --output json | \
+          aws s3api delete-objects \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --delete file:///dev/stdin 2>/dev/null || true
+          # Deletar o bucket vazio
+          aws s3 rb "s3://${{ env.STATE_BUCKET }}"
+          echo "✓ Bucket de state removido"
+
+  # ===========================================================================
+  # JOB 2: CONFIGURAÇÃO (Ansible) — Só executa no apply
+  # ===========================================================================
+  configure:
+    name: '⚙️ Ansible - Provisionar App'
+    runs-on: ubuntu-latest
+    needs: infra
+    if: github.event.inputs.action == 'apply'
+
+    steps:
+      - name: Checkout do Código
+        uses: actions/checkout@v4
+
+      - name: Download SSH Key
+        uses: actions/download-artifact@v4
+        with:
+          name: ssh-key
+          path: /tmp/
+
+      - name: Configurar permissões da chave
+        run: chmod 600 /tmp/ssh_key.pem
+
+      - name: Instalar Ansible
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ansible
+
+      - name: Aguardar EC2 aceitar SSH
+        run: |
+          echo "⏳ Aguardando SSH em ${{ needs.infra.outputs.instance_ip }}..."
+          for i in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+              -i /tmp/ssh_key.pem ubuntu@${{ needs.infra.outputs.instance_ip }} "echo OK" 2>/dev/null; then
+              echo "✓ SSH disponível!"
+              exit 0
+            fi
+            echo "  Tentativa $i/30 — aguardando 10s..."
+            sleep 10
+          done
+          echo "✗ Timeout aguardando SSH"
+          exit 1
+
+      - name: Executar Ansible Playbook
+        working-directory: ${{ env.TF_WORKING_DIR }}/ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+        run: |
+          ansible-playbook playbook.yml \
+            -i "${{ needs.infra.outputs.instance_ip }}," \
+            -u ubuntu \
+            --private-key /tmp/ssh_key.pem \
+            --become \
+            -v
+
+  # ===========================================================================
+  # JOB 3: RESUMO FINAL — URLs + Custo/hora
+  # ===========================================================================
+  summary:
+    name: '📊 Resumo & Custo'
+    runs-on: ubuntu-latest
+    needs: [infra, configure]
+    if: github.event.inputs.action == 'apply'
+
+    steps:
+      - name: Exibir resumo do deploy
+        run: |
+          IP="${{ needs.infra.outputs.instance_ip }}"
+          TYPE="${{ needs.infra.outputs.instance_type }}"
+          TTL="${{ env.LAB_TTL_MINUTES }}"
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║           🚀  SRE DEMO — DEPLOY CONCLUÍDO                  ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║                                                              ║"
+          echo "║  📡 Aplicação:    http://${IP}/api-info                      ║"
+          echo "║  📈 Grafana:      http://${IP}/grafana/    (admin/admin)     ║"
+          echo "║  🔍 Prometheus:   http://${IP}/prometheus/                   ║"
+          echo "║                                                              ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║  🖥️  Instância:   ${TYPE}                                   ║"
+          echo "║  🆔 Instance ID:  ${{ needs.infra.outputs.instance_id }}     ║"
+          echo "║  🌎 Região:       us-east-1                                  ║"
+          echo "║                                                              ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║                   💰 CUSTO ESTIMADO                          ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║                                                              ║"
+          echo "║  EC2 t3.micro:          \$0.0104/hora                        ║"
+          echo "║  EBS 20GB gp3:          \$0.0022/hora                        ║"
+          echo "║  ─────────────────────────────────────────                   ║"
+          echo "║  TOTAL:                 \$0.0126/hora                         ║"
+          echo "║                         ~R\$ 0.07/hora                       ║"
+          echo "║                                                              ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║  ⏱️  AUTO-DESTROY em ${TTL} minutos                          ║"
+          echo "║     A infra será destruída automaticamente.                  ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
+
+      - name: Criar Job Summary (GitHub UI)
+        run: |
+          IP="${{ needs.infra.outputs.instance_ip }}"
+          TYPE="${{ needs.infra.outputs.instance_type }}"
+          TTL="${{ env.LAB_TTL_MINUTES }}"
+
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🚀 SRE Demo — Deploy Concluído
+
+          ### 🔗 Links de Acesso
+          | Serviço | URL |
+          |---------|-----|
+          | **Aplicação** | [http://${IP}/api-info](http://${IP}/api-info) |
+          | **Grafana** | [http://${IP}/grafana/](http://${IP}/grafana/) |
+          | **Prometheus** | [http://${IP}/prometheus/](http://${IP}/prometheus/) |
+
+          > Grafana: usuário \`admin\` / senha \`admin\`
+
+          ### 🖥️ Infraestrutura
+          | Recurso | Valor |
+          |---------|-------|
+          | Instância | \`${TYPE}\` |
+          | ID | \`${{ needs.infra.outputs.instance_id }}\` |
+          | IP Público | \`${IP}\` |
+          | Região | \`us-east-1\` |
+
+          ### 💰 Custo Estimado
+          | Recurso | Custo/hora |
+          |---------|-----------|
+          | EC2 t3.micro | \$0.0104 |
+          | EBS 20GB gp3 | \$0.0022 |
+          | **TOTAL** | **\$0.0126/hr (~R\$ 0.07/hr)** |
+
+          ### ⏱️ Auto-Destroy
+          > A infraestrutura será **destruída automaticamente em ${TTL} minutos**.
+          > Não é necessário executar destroy manualmente.
+          EOF
+
+  # ===========================================================================
+  # JOB 4: AUTO-DESTROY — Aguarda 15min e destrói tudo automaticamente
+  # ===========================================================================
+  auto-destroy:
+    name: '⏱️ Auto-Destroy (15min)'
+    runs-on: ubuntu-latest
+    needs: [infra]
+    if: always() && needs.infra.result == 'success' && github.event.inputs.action == 'apply'
+
+    steps:
+      - name: Checkout do Código
+        uses: actions/checkout@v4
+
+      - name: Countdown para destroy
+        run: |
+          TTL=${{ env.LAB_TTL_MINUTES }}
+          echo "⏱️ Auto-destroy programado para ${TTL} minutos."
+          echo "   Infraestrutura será destruída às $(date -d "+${TTL} minutes" '+%H:%M:%S %Z')"
+          echo ""
+
+          # Countdown com feedback a cada minuto
+          for i in $(seq $TTL -1 1); do
+            echo "   ⏳ Restam ${i} minuto(s)..."
+            sleep 60
+          done
+
+          echo ""
+          echo "🔥 Tempo esgotado! Iniciando destroy..."
+
+      - name: Autenticação AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.7"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.STATE_BUCKET }}" \
+            -backend-config="key=sre-demo/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Destroy
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform destroy -auto-approve
+
+      - name: Destruir bucket de state S3
+        run: |
+          echo "🗑️ Removendo bucket de state..."
+          aws s3api list-object-versions \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+            --output json | \
+          aws s3api delete-objects \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --delete file:///dev/stdin 2>/dev/null || true
+          aws s3api list-object-versions \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+            --output json | \
+          aws s3api delete-objects \
+            --bucket "${{ env.STATE_BUCKET }}" \
+            --delete file:///dev/stdin 2>/dev/null || true
+          aws s3 rb "s3://${{ env.STATE_BUCKET }}"
+          echo "✓ Bucket removido"
+
+      - name: Resumo do auto-destroy
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║     ⏱️  AUTO-DESTROY CONCLUÍDO (TTL: ${{ env.LAB_TTL_MINUTES }}min)              ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║                                                              ║"
+          echo "║  ✓ EC2 terminada                                            ║"
+          echo "║  ✓ VPC removida                                             ║"
+          echo "║  ✓ Todos os recursos eliminados                             ║"
+          echo "║                                                              ║"
+          echo "║  💰 Custo: \$0.00/hora                                      ║"
+          echo "║                                                              ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## ⏱️ Auto-Destroy Concluído
+
+          A infraestrutura foi destruída automaticamente após **${{ env.LAB_TTL_MINUTES }} minutos**.
+
+          - ✅ EC2 Instance removida
+          - ✅ VPC + Subnet + IGW removidos
+          - ✅ Security Group + Key Pair removidos
+          - ✅ Bucket de state S3 removido
+
+          **💰 Custo atual: \$0.00/hora**
+          EOF
+
+  # ===========================================================================
+  # JOB 5: DESTROY SUMMARY (manual)
+  # ===========================================================================
+  destroy-summary:
+    name: '🗑️ Destroy Concluído'
+    runs-on: ubuntu-latest
+    needs: infra
+    if: always() && needs.infra.result == 'success' && github.event.inputs.action == 'destroy'
+
+    steps:
+      - name: Confirmar destruição
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║        🗑️  INFRAESTRUTURA DESTRUÍDA COM SUCESSO            ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║                                                              ║"
+          echo "║  ✓ VPC removida                                             ║"
+          echo "║  ✓ EC2 terminada                                            ║"
+          echo "║  ✓ Security Group removido                                  ║"
+          echo "║  ✓ Key Pair removido                                        ║"
+          echo "║  ✓ Bucket de state S3 removido                              ║"
+          echo "║                                                              ║"
+          echo "║  💰 Custo: \$0.00/hora (recursos eliminados)                ║"
+          echo "║                                                              ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
+
+      - name: Criar Job Summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🗑️ Infraestrutura Destruída (Manual)
+
+          Todos os recursos foram removidos com sucesso:
+          - ✅ VPC + Subnet + IGW
+          - ✅ EC2 Instance
+          - ✅ Security Group
+          - ✅ Key Pair
+          - ✅ Bucket de state S3
+
+          **💰 Custo atual: \$0.00/hora**
+          EOF

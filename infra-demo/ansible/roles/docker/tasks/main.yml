@@ -1,0 +1,31 @@
+---
+- name: Verificar se Docker já está instalado
+  ansible.builtin.command:
+    cmd: docker --version
+  register: docker_installed
+  ignore_errors: true
+  changed_when: false
+
+- name: Carregar tarefas de instalação para Debian/Ubuntu
+  ansible.builtin.include_tasks: debian.yml
+  when:
+    - docker_installed.rc != 0
+    - ansible_os_family == "Debian"
+
+- name: Carregar tarefas de instalação para RedHat/CentOS
+  ansible.builtin.include_tasks: redhat.yml
+  when:
+    - docker_installed.rc != 0
+    - ansible_os_family == "RedHat"
+
+- name: Garantir que o serviço Docker esteja em execução
+  ansible.builtin.systemd:
+    name: docker
+    state: started
+    enabled: true
+
+- name: Adicionar usuário ao grupo docker
+  ansible.builtin.user:
+    name: "{{ ansible_user_id }}"
+    groups: docker
+    append: true

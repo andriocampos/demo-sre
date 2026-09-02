@@ -1,0 +1,51 @@
+---
+- name: Criar diretório do projeto no host
+  ansible.builtin.file:
+    path: /opt/sre-demo
+    state: directory
+    mode: "0755"
+
+- name: Copiar arquivos do projeto para o host
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "/opt/sre-demo/{{ item.dest }}"
+    mode: "0644"
+  loop:
+    - { src: "docker-compose.yml", dest: "docker-compose.yml" }
+
+- name: Copiar diretório da aplicação Go
+  ansible.builtin.copy:
+    src: "http-server-projeto-demo-api/"
+    dest: "/opt/sre-demo/http-server-projeto-demo-api/"
+    mode: "0644"
+
+- name: Copiar diretório do Nginx
+  ansible.builtin.copy:
+    src: "nginx/"
+    dest: "/opt/sre-demo/nginx/"
+    mode: "0644"
+
+- name: Copiar diretório do Prometheus
+  ansible.builtin.copy:
+    src: "prometheus/"
+    dest: "/opt/sre-demo/prometheus/"
+    mode: "0644"
+
+- name: Copiar diretório do Grafana
+  ansible.builtin.copy:
+    src: "grafana/"
+    dest: "/opt/sre-demo/grafana/"
+    mode: "0644"
+
+- name: Build e execução dos containers com Docker Compose
+  ansible.builtin.command:
+    cmd: docker compose up --build -d --force-recreate
+    chdir: /opt/sre-demo
+  changed_when: true
+
+- name: Aguardar containers ficarem prontos
+  ansible.builtin.wait_for:
+    port: 80
+    host: localhost
+    delay: 5
+    timeout: 60
