@@ -10,11 +10,11 @@ Repositório de portfólio que demonstra práticas reais de **CI/CD**, **GitOps*
 |---|---|
 | **CI/CD** | Pipelines automatizadas com GitHub Actions (plan em PR, apply na main) |
 | **GitOps** | Infraestrutura versionada no Git — toda mudança passa por workflow |
-| **IaC** | Terraform modular (VPC, EC2, IAM, S3) com state management |
+| **IaC** | Terraform modular (VPC, EC2, Security Group, Key Pair) com backend S3 |
 | **Configuração** | Ansible com roles idempotentes (Docker, Deploy, Validate) |
 | **Segurança** | Autenticação sem credenciais estáticas via OIDC (keyless) |
 | **Observabilidade** | Stack de monitoramento (Prometheus + Grafana) provisionada automaticamente |
-| **FinOps** | Auto-destroy com TTL, bloqueio de execuções simultâneas e estimativa de custo/hora |
+| **FinOps** | Bloqueio de execuções simultâneas, state efêmero e estimativa de custo/hora |
 
 ---
 
@@ -28,13 +28,8 @@ Repositório de portfólio que demonstra práticas reais de **CI/CD**, **GitOps*
 │  │🔒 Check  │──▶│Terraform│──▶│Ansible │──▶│ Summary + Cost │   │
 │  │Concurrent│   │ (Infra) │   │(Config)│   │  (Job Summary) │   │
 │  └──────────┘   └─────────┘   └────────┘   └────────────────┘   │
-│                                                     │             │
-│                                              ┌──────▼──────────┐  │
-│                                              │ ⏱️ Auto-Destroy  │  │
-│                                              │  (15min timer)  │  │
-│                                              └──────┬──────────┘  │
-│                                                     │             │
-│                                              terraform destroy    │
+│                                                                    │
+│   🗑️  Destroy é MANUAL: Run workflow → action = destroy           │
 └──────────────────────────────────────────────────────────────────┘
                          │
                          ▼
@@ -62,38 +57,22 @@ Repositório de portfólio que demonstra práticas reais de **CI/CD**, **GitOps*
 ```
 .
 ├── .github/workflows/
-│   ├── deploy-sre-demo.yml     # 🚀 Pipeline principal (apply/destroy one-click)
-│   ├── lab-s3.yml              # Lab S3 com dispatch manual
-│   ├── test-oidc.yml           # Teste de autenticação OIDC
-│   └── desagio-labs3.yml       # Primeiro workflow didático
+│   └── deploy-sre-demo.yml     # 🚀 Pipeline principal (apply/destroy one-click)
 │
-├── infra-demo/                  # Módulo principal — VPC + EC2 + Ansible
-│   ├── versions.tf             # Terraform >= 1.5.7, backend S3 dinâmico
-│   ├── provider.tf             # AWS provider (us-east-1)
-│   ├── variables.tf            # Variáveis parametrizáveis
-│   ├── vpc.tf                  # VPC + Subnet + IGW + Route Table
-│   ├── ec2.tf                  # Security Group + Key Pair + EC2
-│   ├── outputs.tf              # IP público, instance ID, chave SSH
-│   └── ansible/                # Automação de configuração
-│       ├── playbook.yml
-│       └── roles/
-│           ├── docker/         # Instalação Docker (Debian/RedHat)
-│           ├── deploy/         # Build + Docker Compose (App + Monitoramento)
-│           └── validate/       # Testa endpoints + rollback automático
-│
-├── aws-github-auth/             # OIDC Provider + IAM Role (GitHub → AWS)
-│   └── oidc.tf
-│
-├── infra/                       # Módulo VPC avançado (multi-AZ, for_each)
-│   ├── vpc.tf
-│   └── variables.tf
-│
-├── desafios-lab/                # Labs isolados
-│   └── lab-s3/                  # Bucket S3 com random suffix
-│
-└── docs/                        # Documentação técnica
-    ├── ec2-iam-role-instance-profile.md
-    └── guia-github-actions.md
+└── infra-demo/                  # Módulo principal — VPC + EC2 + Ansible
+    ├── versions.tf             # Terraform >= 1.5.7, backend S3 dinâmico
+    ├── provider.tf             # AWS provider (us-east-1)
+    ├── variables.tf            # Variáveis parametrizáveis
+    ├── vpc.tf                  # VPC + Subnet + IGW + Route Table
+    ├── ec2.tf                  # Security Group + Key Pair + EC2
+    ├── outputs.tf              # IP público, instance ID, chave SSH
+    └── ansible/                # Automação de configuração
+        ├── playbook.yml
+        ├── ansible.cfg
+        └── roles/
+            ├── docker/         # Instalação Docker (Debian/RedHat)
+            ├── deploy/         # Build + Docker Compose (App + Monitoramento)
+            └── validate/       # Testa endpoints + rollback automático
 ```
 
 ---
@@ -106,9 +85,10 @@ Repositório de portfólio que demonstra práticas reais de **CI/CD**, **GitOps*
 2. Clique **Run workflow** → selecione `apply`
 3. Aguarde ~5 minutos
 4. Acesse os links no **Job Summary**
-5. ⏱️ Após **15 minutos**, a infra é destruída automaticamente
 
-### Destruir manualmente (antes do TTL)
+> ⚠️ **Não há auto-destroy.** A infraestrutura permanece ativa (gerando custo) até você destruí-la manualmente.
+
+### Destruir (obrigatório ao terminar)
 
 1. Mesmo workflow → selecione `destroy`
 2. Remove **toda** a infraestrutura + bucket de state
@@ -135,28 +115,9 @@ E a estimativa de custo:
 
 ## 💰 Segurança de Custo (FinOps)
 
-Este lab implementa duas travas automáticas para evitar gastos acidentais:
-
-### ⏱️ Auto-Destroy (TTL: 15 minutos)
-
-Após o deploy completo, um job de countdown é iniciado automaticamente:
-
-```
-apply → infra → ansible → summary → auto-destroy (15min timer)
-                                          │
-                                    ┌─────┴─────┐
-                                    │  sleep 60  │ ← log a cada minuto
-                                    │  × 15      │
-                                    └─────┬─────┘
-                                          │
-                                          ▼
-                                  terraform destroy
-                                  + cleanup bucket S3
-```
-
-- O countdown exibe `Restam X minuto(s)...` no log a cada minuto
-- Após 15 min, executa `terraform destroy -auto-approve` + remove bucket de state
-- **TTL configurável** via variável `LAB_TTL_MINUTES` no workflow
+> ⚠️ **Atenção:** este lab **não possui destruição automática**. Ao terminar de usar,
+> execute o workflow com `action = destroy` para não gerar custo contínuo.
+> Recomenda-se configurar um **AWS Budgets** para alertas de gasto.
 
 ### 🔒 Bloqueio de Execução Simultânea
 
@@ -167,29 +128,28 @@ Se você tentar um novo `apply` com a infra ainda ativa, o workflow **bloqueia**
 ║           🚫  EXECUÇÃO BLOQUEADA                    ║
 ╠══════════════════════════════════════════════════════╣
 ║                                                      ║
-║  O Lab já está em execução há 10 min.               ║
-║  Faltam 5 min para o destroy automático.            ║
+║  O Lab já está em execução há ~10 min.              ║
+║  ⚠️  NÃO há destroy automático — destrua manualmente.║
 ║                                                      ║
 ║  Opções:                                            ║
-║    1. Aguarde o destroy automático                  ║
+║    1. Use o lab existente                           ║
 ║    2. Execute manualmente com action = destroy      ║
 ║                                                      ║
 ╚══════════════════════════════════════════════════════╝
 ```
 
 **Como funciona:**
-- Consulta instâncias EC2 com tag `Environment=sre-demo` em estado `running`
-- Calcula tempo decorrido desde o `LaunchTime` da instância
-- Compara com o TTL (15min) e exibe tempo restante
-- Impede criação de infraestrutura duplicada
+- Verifica se o **bucket de state S3** (`tfstate-sre-demo-lab`) já existe
+- Se existir, o lab está ativo → calcula há quanto tempo pelo `LastModified` do state
+- Impede a criação de infraestrutura duplicada (`exit 1`)
 
 ### Resumo das proteções
 
 | Proteção | Gatilho | Ação |
 |----------|---------|------|
-| Auto-destroy | 15 min após deploy | Destrói tudo automaticamente |
-| Bloqueio simultâneo | EC2 `sre-demo` ativa | Bloqueia apply + exibe tempo restante |
+| Bloqueio simultâneo | Bucket de state S3 existente | Bloqueia apply + exibe tempo ativo |
 | State efêmero | Cada ciclo apply/destroy | Bucket S3 criado e removido junto |
+| Estimativa de custo | Ao final do apply | Exibe custo/hora no Job Summary |
 
 ---
 
@@ -223,8 +183,6 @@ Se você tentar um novo `apply` com a infra ainda ativa, o workflow **bloqueia**
 | Workflow | Trigger | Descrição |
 |----------|---------|-----------|
 | `deploy-sre-demo.yml` | Manual (apply/destroy) | Pipeline completa: Infra + Config + Validação |
-| `lab-s3.yml` | Manual (apply/destroy) | Cria/destrói bucket S3 |
-| `test-oidc.yml` | Manual | Valida autenticação OIDC com `sts get-caller-identity` |
 
 ---
 
@@ -233,21 +191,14 @@ Se você tentar um novo `apply` com a infra ainda ativa, o workflow **bloqueia**
 | Decisão | Justificativa |
 |---------|---------------|
 | Backend S3 efêmero | Lab descartável — state criado e destruído junto com a infra |
-| Auto-destroy (TTL 15min) | Impede esquecimento — garante custo máximo de ~R$0.02 por execução |
+| Destroy manual | Controle explícito do ciclo de vida — sem timers automáticos |
 | Bloqueio de concorrência | Evita infra duplicada e custos desnecessários |
-| Tag-based detection | Usa tags EC2 para detectar lab ativo (sem dependência de state) |
+| Lock via bucket de state | Presença do bucket S3 sinaliza lab ativo (sem dependência de tags) |
 | `t3.micro` | Suficiente para demo, custo mínimo ($0.012/hr) |
 | Ansible via SSH (não SSM) | Demonstra configuração clássica + key management |
 | Validação com rollback | Se algum serviço não responde, o Ansible desfaz o deploy |
 | `terraform_wrapper: false` | Permite capturar outputs diretamente no workflow |
 | `tls_private_key` no Terraform | Chave efêmera — não precisa de secrets management para lab |
-
----
-
-## 📚 Documentação adicional
-
-- [EC2 IAM Roles & Instance Profiles](docs/ec2-iam-role-instance-profile.md)
-- [Guia GitHub Actions](docs/guia-github-actions.md)
 
 ---
 
