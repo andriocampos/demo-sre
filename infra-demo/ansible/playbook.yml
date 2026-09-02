@@ -1,0 +1,10 @@
+---
+- name: Provisionar ambiente SRE Demo
+  hosts: all
+  become: true
+  gather_facts: true
+
+  roles:
+    - docker
+    - deploy
+    - validate

@@ -1,0 +1,96 @@
+---
+- name: Validar funcionamento do serviço
+  ansible.builtin.uri:
+    url: http://localhost/api-info
+    method: GET
+    return_content: true
+    status_code: 200
+  register: response
+  ignore_errors: true
+
+- name: Validar que as métricas estão sendo expostas
+  ansible.builtin.command:
+    cmd: docker exec http-server-projeto-demo-api wget -qO- http://localhost:8080/metrics
+  register: metrics_response
+  changed_when: false
+  ignore_errors: true
+
+- name: Validar que o Prometheus está coletando dados
+  ansible.builtin.command:
+    cmd: docker exec prometheus wget -qO- http://localhost:9090/-/healthy
+  register: prometheus_health
+  changed_when: false
+  ignore_errors: true
+
+- name: Validar que o Grafana está acessível
+  ansible.builtin.uri:
+    url: http://localhost/grafana/api/health
+    method: GET
+    status_code: 200
+  register: grafana_health
+  retries: 5
+  delay: 10
+  until: grafana_health.status == 200
+  ignore_errors: true
+
+- name: Definir status de validação
+  ansible.builtin.set_fact:
+    validation_failed: >-
+      {{
+        (response is failed) or
+        (metrics_response is failed) or
+        ('http_server_up' not in (metrics_response.stdout | default(''))) or
+        (prometheus_health is failed) or
+        (grafana_health is failed)
+      }}
+
+- name: Exibir resumo — SUCESSO
+  ansible.builtin.debug:
+    msg: |
+      ===== ✓ VALIDAÇÃO COMPLETA — SUCESSO =====
+      App (/api-info):    ✓ HTTP {{ response.status | default('FALHOU') }}
+      Métricas:           ✓ http_server_up exposto
+      Prometheus:         ✓ {{ prometheus_health.stdout | default('OK') }}
+      Grafana:            ✓ HTTP {{ grafana_health.status | default('FALHOU') }}
+      
+      Resposta da aplicação:
+      {{ response.content | default('N/A') }}
+      =============================================
+  when: not validation_failed
+
+- name: Exibir resumo — FALHA
+  ansible.builtin.debug:
+    msg: |
+      ===== ✗ VALIDAÇÃO FALHOU =====
+      App (/api-info):    {{ '✓' if response is succeeded else '✗ FALHOU' }}
+      Métricas:           {{ '✓' if (metrics_response is succeeded and 'http_server_up' in (metrics_response.stdout | default(''))) else '✗ FALHOU' }}
+      Prometheus:         {{ '✓' if prometheus_health is succeeded else '✗ FALHOU' }}
+      Grafana:            {{ '✓' if grafana_health is succeeded else '✗ FALHOU' }}
+      ================================
+  when: validation_failed
+
+- name: "ROLLBACK — Removendo containers (validação falhou)"
+  ansible.builtin.command:
+    cmd: docker compose down
+    chdir: /opt/sre-demo
+  when: validation_failed
+  changed_when: true
+
+- name: "ROLLBACK — Aviso"
+  ansible.builtin.debug:
+    msg: |
+      ===== ⚠ ROLLBACK EXECUTADO =====
+      Motivo: Validação falhou — serviço não respondeu conforme esperado
+      Ação: containers removidos para evitar estado inconsistente
+      
+      Próximos passos:
+        1. Verificar logs: docker compose -f /opt/sre-demo/docker-compose.yml logs
+        2. Corrigir o problema
+        3. Executar o playbook novamente
+      ===================================
+  when: validation_failed
+
+- name: Forçar falha do playbook após rollback
+  ansible.builtin.fail:
+    msg: "Deploy revertido — validação não passou. Verifique os logs acima."
+  when: validation_failed

@@ -1,0 +1,23 @@
+---
+- name: Instalar yum-utils
+  ansible.builtin.yum:
+    name: yum-utils
+    state: present
+
+- name: Configurar repositório do Docker
+  ansible.builtin.yum_repository:
+    name: docker-ce-stable
+    description: Docker CE Stable
+    baseurl: https://download.docker.com/linux/centos/$releasever/$basearch/stable
+    gpgcheck: true
+    gpgkey: https://download.docker.com/linux/centos/gpg
+    state: present
+
+- name: Instalar Docker Engine e Compose plugin
+  ansible.builtin.yum:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-compose-plugin
+    state: present
